@@ -10,7 +10,7 @@ from starlette.background import BackgroundTask
 import utils.globals as globals
 from app import app, templates, security_scheme
 from chatgpt.ChatService import ChatService
-from chatgpt.authorization import refresh_all_tokens
+from chatgpt.authorization import refresh_all_tokens, get_req_token
 from utils.Logger import logger
 from utils.configs import api_prefix, scheduled_refresh
 from utils.retry import async_retry
@@ -71,13 +71,7 @@ async def process(request_data, req_token):
 @app.post(f"/{api_prefix}/v1/chat/completions" if api_prefix else "/v1/chat/completions")
 async def send_conversation(request: Request, credentials: HTTPAuthorizationCredentials = Security(security_scheme)):
     req_token = credentials.credentials
-    # Workaround: if API key is used, load JWT from token file
-    if req_token == "VxLPfenGeb":
-        try:
-            with open('/app/data/token.txt', 'r') as f:
-                req_token = f.read().strip()
-        except Exception:
-            pass
+    req_token = get_req_token(req_token)
     try:
         request_data = await request.json()
     except Exception:
@@ -164,6 +158,72 @@ async def clear_seed_tokens():
 import re
 import time
 import json
+import hashlib
+import aiohttp
+import os
+
+# 图片下载相关
+IMG_DOWNLOAD_DIR = "/app/data/generated_images"
+
+
+def _ensure_download_dir():
+    os.makedirs(IMG_DOWNLOAD_DIR, exist_ok=True)
+
+
+async def _download_image(url: str, req_token: str, proxy_url: str) -> str:
+    """
+    用带登录态的 session 下载图片，返回服务器本地路径。
+    req_token: JWT accessToken，用于认证。
+    """
+    _ensure_download_dir()
+    # 从 URL 生成唯一文件名
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+    ext = os.path.splitext(url.split("?")[0])[1] or ".png"
+    if len(ext) > 5:
+        ext = ".png"
+    filename = f"{url_hash}_{int(time.time() * 1000)}{ext}"
+    local_path = os.path.join(IMG_DOWNLOAD_DIR, filename)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Authorization": f"Bearer {req_token}",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers, proxy=proxy_url if proxy_url else None) as resp:
+                if resp.status != 200:
+                    logger.error(f"[IMG_DOWNLOAD] Failed to download {url}: HTTP {resp.status}")
+                    return None
+                content = await resp.read()
+                with open(local_path, "wb") as f:
+                    f.write(content)
+                logger.info(f"[IMG_DOWNLOAD] Saved {len(content)} bytes to {local_path}")
+                return local_path
+    except Exception as e:
+        logger.error(f"[IMG_DOWNLOAD] Error downloading {url}: {e}")
+        return None
+
+
+@app.get("/v1/images/generations/file/{filename}")
+async def serve_generated_image(filename: str):
+    """
+    公开图片下载入口，绕过登录态。
+    文件必须位于 IMG_DOWNLOAD_DIR 下防止路径穿越。
+    """
+    # 安全检查：只允许已下载的文件
+    safe_name = os.path.basename(filename)
+    if not safe_name or safe_name != filename:
+        raise HTTPException(status_code=403, detail="Invalid filename")
+    file_path = os.path.join(IMG_DOWNLOAD_DIR, safe_name)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    from starlette.responses import FileResponse
+    return FileResponse(
+        file_path,
+        media_type="image/png",
+        filename=safe_name,
+    )
 
 
 async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
@@ -190,6 +250,11 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
                 node = mapping[cur]
                 parts = node.get("message", {}).get("content", {}).get("parts", [])
                 logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | parts_count={len(parts)} | parts_types={[p.get('content_type') if isinstance(p,dict) else type(p).__name__ for p in parts]}")
+                # Log str content for debugging
+                for p in parts:
+                    if isinstance(p, str) and p.strip():
+                        logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | str_content={p[:200]!r}")
+                        break
                 for p in parts:
                     if isinstance(p, dict) and p.get("content_type") == "image_asset_pointer":
                         asset = p.get("asset_pointer", "")
@@ -221,13 +286,7 @@ async def images_generations(
     credentials: HTTPAuthorizationCredentials = Security(security_scheme),
 ):
     req_token = credentials.credentials
-    # Workaround: if API key is used, load JWT from token file
-    if req_token == "VxLPfenGeb":
-        try:
-            with open('/app/data/token.txt', 'r') as f:
-                req_token = f.read().strip()
-        except Exception:
-            pass
+    req_token = get_req_token(req_token)
     try:
         body = await request.json()
     except Exception:
@@ -330,10 +389,24 @@ async def images_generations(
             )
 
         logger.info(f"[IMAGES_GEN] RESPONSE | total_urls={len(image_urls)} | urls={image_urls}")
+
+        # Download images to server and return public URLs
+        public_urls = []
+        for url in image_urls:
+            local_path = await _download_image(url, req_token, cs.proxy_url)
+            if local_path:
+                filename = os.path.basename(local_path)
+                public_url = f"http://18.139.145.60:9001/v1/images/generations/file/{filename}"
+                public_urls.append(public_url)
+                logger.info(f"[IMAGES_GEN] PUBLIC_URL | {url} -> {public_url}")
+            else:
+                # Fallback: return original URL
+                public_urls.append(url)
+
         # Increment successful generation counter
         new_count = _inc_img_gen_count()
         logger.info(f"[IMG_COUNT] Incremented to {new_count}")
-        return {"created": int(time.time()), "data": [{"url": u} for u in image_urls]}
+        return {"created": int(time.time()), "data": [{"url": u} for u in public_urls]}
 
     except HTTPException:
         if hasattr(cs, "s"):
