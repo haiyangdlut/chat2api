@@ -17,6 +17,24 @@ from utils.retry import async_retry
 
 scheduler = AsyncIOScheduler()
 
+IMG_COUNT_FILE = "/app/data/img_gen_count.json"
+
+def _get_img_gen_count():
+    try:
+        with open(IMG_COUNT_FILE, "r") as f:
+            return json.load(f).get("count", 0)
+    except Exception:
+        return 0
+
+def _inc_img_gen_count():
+    try:
+        count = _get_img_gen_count() + 1
+        with open(IMG_COUNT_FILE, "w") as f:
+            json.dump({"count": count}, f)
+        return count
+    except Exception as e:
+        logger.error(f"[IMG_COUNT] Failed to write count: {e}")
+        return None
 
 @app.on_event("startup")
 async def app_start():
@@ -53,6 +71,13 @@ async def process(request_data, req_token):
 @app.post(f"/{api_prefix}/v1/chat/completions" if api_prefix else "/v1/chat/completions")
 async def send_conversation(request: Request, credentials: HTTPAuthorizationCredentials = Security(security_scheme)):
     req_token = credentials.credentials
+    # Workaround: if API key is used, load JWT from token file
+    if req_token == "VxLPfenGeb":
+        try:
+            with open('/app/data/token.txt', 'r') as f:
+                req_token = f.read().strip()
+        except Exception:
+            pass
     try:
         request_data = await request.json()
     except Exception:
@@ -115,7 +140,7 @@ async def error_tokens():
     return {"status": "success", "error_tokens": error_tokens_list}
 
 
-@app.get(f"/{api_prefix}/tokens/add/{{token}}" if api_prefix else "/tokens/add/{token}")
+@app.get(f"/{api_prefix}/tokens/add/{token}" if api_prefix else "/tokens/add/{token}")
 async def add_token(token: str):
     if token.strip() and not token.startswith("#"):
         globals.token_list.append(token.strip())
@@ -141,7 +166,7 @@ import time
 import json
 
 
-async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=60):
+async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
     """Poll /conversation/{id} for generated image URLs."""
     urls = []
     logger.info(f"[IMAGES_GEN] POLL_START | conv_id={conv_id} | max_attempts={max_attempts} | wait_initial={wait_initial}s")
@@ -155,13 +180,16 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=60):
                 impersonate="chrome123",
             )
             if r.status_code != 200:
+                logger.warning(f"[IMAGES_GEN] POLL | attempt={i+1} | status={r.status_code}")
                 continue
             data = r.json()
             mapping = data.get("mapping", {})
             cur = data.get("current_node", "")
+            logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | status=200 | mapping_count={len(mapping)} | current_node={cur}")
             if cur and cur in mapping:
                 node = mapping[cur]
                 parts = node.get("message", {}).get("content", {}).get("parts", [])
+                logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | parts_count={len(parts)} | parts_types={[p.get('content_type') if isinstance(p,dict) else type(p).__name__ for p in parts]}")
                 for p in parts:
                     if isinstance(p, dict) and p.get("content_type") == "image_asset_pointer":
                         asset = p.get("asset_pointer", "")
@@ -175,6 +203,8 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=60):
                         if url:
                             logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | found_url={url}")
                             urls.append(url)
+            else:
+                logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | current_node empty or not in mapping")
             if urls:
                 logger.info(f"[IMAGES_GEN] POLL | break early, got {len(urls)} url(s)")
                 break
@@ -191,6 +221,13 @@ async def images_generations(
     credentials: HTTPAuthorizationCredentials = Security(security_scheme),
 ):
     req_token = credentials.credentials
+    # Workaround: if API key is used, load JWT from token file
+    if req_token == "VxLPfenGeb":
+        try:
+            with open('/app/data/token.txt', 'r') as f:
+                req_token = f.read().strip()
+        except Exception:
+            pass
     try:
         body = await request.json()
     except Exception:
@@ -293,6 +330,9 @@ async def images_generations(
             )
 
         logger.info(f"[IMAGES_GEN] RESPONSE | total_urls={len(image_urls)} | urls={image_urls}")
+        # Increment successful generation counter
+        new_count = _inc_img_gen_count()
+        logger.info(f"[IMG_COUNT] Incremented to {new_count}")
         return {"created": int(time.time()), "data": [{"url": u} for u in image_urls]}
 
     except HTTPException:
@@ -307,6 +347,12 @@ async def images_generations(
             status_code=500,
             detail={"error": {"message": str(e), "type": "server_error"}},
         )
+
+
+@app.get("/v1/images/generations/count")
+async def images_generations_count():
+    count = _get_img_gen_count()
+    return {"count": count}
 
 
 # ===================== DEBUG LOGGING END =====================
