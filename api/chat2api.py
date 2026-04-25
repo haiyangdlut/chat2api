@@ -37,7 +37,8 @@ async def to_send_conversation(request_data, req_token):
         await chat_service.close_client()
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
-        await chat_service.close_client()
+        if hasattr(chat_service, 's'):
+            await chat_service.close_client()
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
 
@@ -71,7 +72,8 @@ async def send_conversation(request: Request, credentials: HTTPAuthorizationCred
             raise HTTPException(status_code=500, detail="Server error")
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
-        await chat_service.close_client()
+        if hasattr(chat_service, 's'):
+            await chat_service.close_client()
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
 
@@ -134,3 +136,179 @@ async def clear_seed_tokens():
         f.write("{}")
     logger.info(f"Seed token count: {len(globals.seed_map)}")
     return {"status": "success", "seed_tokens_count": len(globals.seed_map)}
+import re
+import time
+import json
+
+
+async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=60):
+    """Poll /conversation/{id} for generated image URLs."""
+    urls = []
+    logger.info(f"[IMAGES_GEN] POLL_START | conv_id={conv_id} | max_attempts={max_attempts} | wait_initial={wait_initial}s")
+    await asyncio.sleep(wait_initial)
+    for i in range(max_attempts):
+        try:
+            r = await cs.s.get(
+                f"{cs.base_url}/conversation/{conv_id}",
+                headers=cs.chat_headers,
+                proxy=cs.proxy_url,
+                impersonate="chrome123",
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            mapping = data.get("mapping", {})
+            cur = data.get("current_node", "")
+            if cur and cur in mapping:
+                node = mapping[cur]
+                parts = node.get("message", {}).get("content", {}).get("parts", [])
+                for p in parts:
+                    if isinstance(p, dict) and p.get("content_type") == "image_asset_pointer":
+                        asset = p.get("asset_pointer", "")
+                        fid = asset.split("://")[-1]
+                        if asset.startswith("file-service://"):
+                            url = await cs.get_download_url(fid)
+                        elif asset.startswith("sediment://"):
+                            url = await cs.get_attachment_url(fid, conv_id)
+                        else:
+                            continue
+                        if url:
+                            logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | found_url={url}")
+                            urls.append(url)
+            if urls:
+                logger.info(f"[IMAGES_GEN] POLL | break early, got {len(urls)} url(s)")
+                break
+        except Exception as e:
+            logger.error(f"[IMAGES_GEN] Poll error: {e}")
+        await asyncio.sleep(8)
+    logger.info(f"[IMAGES_GEN] POLL_END | total_urls={len(urls)} | attempts={i+1}")
+    return urls
+
+
+@app.post("/v1/images/generations")
+async def images_generations(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Security(security_scheme),
+):
+    req_token = credentials.credentials
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+        )
+
+    model = body.get("model", "gpt-image-2")
+    prompt = body.get("prompt", "")
+    size = body.get("size", "")
+    image_refs = body.get("image", [])
+    logger.info(f"[IMAGES_GEN] REQUEST | model={model} | size={size} | prompt={prompt[:80]!r} | images={image_refs}")
+    if size:
+        prompt = f"[{size}] {prompt}"
+    image_refs = body.get("image", [])
+
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "prompt is required", "type": "invalid_request_error"}},
+        )
+
+    # Build chat completions messages format
+    user_content = [{"type": "text", "text": prompt}]
+    refs = image_refs if isinstance(image_refs, list) else [image_refs]
+    for ref in refs:
+        if ref and isinstance(ref, str):
+            user_content.append({"type": "image_url", "image_url": {"url": ref}})
+
+    request_data = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "stream": True,
+    }
+
+    cs = ChatService(req_token)
+    try:
+        await cs.set_dynamic_data(request_data)
+        await cs.get_chat_requirements()
+        cs.image_gen_mode = True
+        cs.history_disabled = False
+        await cs.prepare_send_conversation()
+    except HTTPException:
+        if hasattr(cs, "s"):
+            await cs.close_client()
+        raise
+    except Exception as e:
+        if hasattr(cs, "s"):
+            await cs.close_client()
+        logger.error(f"[IMAGES_GEN] Setup error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": {"message": str(e), "type": "server_error"}},
+        )
+
+    try:
+        res = await cs.send_conversation()
+        image_urls = []
+        conv_id = None
+
+        if isinstance(res, types.AsyncGeneratorType):
+            async for chunk in res:
+                text = chunk if isinstance(chunk, str) else chunk.decode()
+                # Extract conversation_id from SSE chunks
+                if conv_id is None and '"conversation_id"' in text:
+                    m = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', text)
+                    if m:
+                        conv_id = m.group(1)
+                # Extract image URLs from ![image](url) pattern
+                found = re.findall(r"!\[image\]\(([^)]+)\)", text)
+                if found:
+                    logger.info(f"[IMAGES_GEN] STREAM_IMG | found={found}")
+                image_urls.extend(found)
+        else:
+            # Non-stream response
+            content = ""
+            try:
+                content = (
+                    res.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+            except Exception:
+                pass
+            image_urls = re.findall(r"!\[image\]\(([^)]+)\)", content)
+
+        # If no images in stream, poll conversation for async results
+        if not image_urls and conv_id:
+            logger.info(f"[IMAGES_GEN] No images in stream, polling conv {conv_id}")
+            image_urls = await _poll_images(cs, conv_id)
+
+        if hasattr(cs, "s"):
+            await cs.close_client()
+
+        if not image_urls:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": {"message": "Image generation failed or timed out", "type": "server_error"}},
+            )
+
+        logger.info(f"[IMAGES_GEN] RESPONSE | total_urls={len(image_urls)} | urls={image_urls}")
+        return {"created": int(time.time()), "data": [{"url": u} for u in image_urls]}
+
+    except HTTPException:
+        if hasattr(cs, "s"):
+            await cs.close_client()
+        raise
+    except Exception as e:
+        if hasattr(cs, "s"):
+            await cs.close_client()
+        logger.error(f"[IMAGES_GEN] Error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": {"message": str(e), "type": "server_error"}},
+        )
+
+
+# ===================== DEBUG LOGGING END =====================
+# ===================== DEBUG LOGGING END =====================
+# ===================== DEBUG LOGGING END =====================
