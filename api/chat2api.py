@@ -15,6 +15,9 @@ from utils.Logger import logger
 from utils.configs import api_prefix, scheduled_refresh
 from utils.retry import async_retry
 
+# 记录当前正在使用的 token（用于图片生成换 token 时优先选空闲的）
+_img_gen_active_tokens: set = set()
+
 scheduler = AsyncIOScheduler()
 
 IMG_COUNT_FILE = "/app/data/img_gen_count.json"
@@ -155,6 +158,7 @@ async def clear_seed_tokens():
         f.write("{}")
     logger.info(f"Seed token count: {len(globals.seed_map)}")
     return {"status": "success", "seed_tokens_count": len(globals.seed_map)}
+import random
 import re
 import time
 import json
@@ -226,9 +230,40 @@ async def serve_generated_image(filename: str):
     )
 
 
+class _RateLimitError(Exception):
+    """轮询时遇到持续 429，需要换 token 重试"""
+    pass
+
+
+def _pick_idle_token(current_token: str) -> str:
+    """
+    从可用 token 列表中优先选一个当前没在跑图片生成的 token。
+    如果全都在用，则随机选一个（不选当前 token）。
+    """
+    available = list(set(globals.token_list) - set(globals.error_token_list))
+    if len(available) <= 1:
+        return current_token  # 只有一个 token，没得换
+    idle = [t for t in available if t not in _img_gen_active_tokens and t != current_token]
+    if idle:
+        chosen = random.choice(idle)
+        logger.info(f"[IMAGES_GEN] TOKEN_SWITCH | idle_count={len(idle)} | chosen=...{chosen[-8:]}")
+        return chosen
+    # 全都在用，选一个不是当前的
+    others = [t for t in available if t != current_token]
+    if others:
+        chosen = random.choice(others)
+        logger.info(f"[IMAGES_GEN] TOKEN_SWITCH | all_busy, fallback | chosen=...{chosen[-8:]}")
+        return chosen
+    return current_token
+
+
 async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
-    """Poll /conversation/{id} for generated image URLs."""
+    """Poll /conversation/{id} for generated image URLs.
+    Raises _RateLimitError if too many 429s are encountered (need token switch).
+    """
     urls = []
+    consecutive_429 = 0
+    MAX_CONSECUTIVE_429 = 5  # 连续 5 次 429 就认为该 token 被限流，触发换 token
     logger.info(f"[IMAGES_GEN] POLL_START | conv_id={conv_id} | max_attempts={max_attempts} | wait_initial={wait_initial}s")
     await asyncio.sleep(wait_initial)
     for i in range(max_attempts):
@@ -239,9 +274,20 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
                 proxy=cs.proxy_url,
                 impersonate="chrome123",
             )
-            if r.status_code != 200:
-                logger.warning(f"[IMAGES_GEN] POLL | attempt={i+1} | status={r.status_code}")
+            if r.status_code == 429:
+                consecutive_429 += 1
+                logger.warning(f"[IMAGES_GEN] POLL | attempt={i+1} | status=429 | consecutive={consecutive_429}")
+                if consecutive_429 >= MAX_CONSECUTIVE_429:
+                    logger.warning(f"[IMAGES_GEN] POLL | {consecutive_429} consecutive 429s, triggering token switch")
+                    raise _RateLimitError(f"Too many 429s on conv {conv_id}")
+                await asyncio.sleep(8)
                 continue
+            if r.status_code != 200:
+                consecutive_429 = 0
+                logger.warning(f"[IMAGES_GEN] POLL | attempt={i+1} | status={r.status_code}")
+                await asyncio.sleep(8)
+                continue
+            consecutive_429 = 0
             data = r.json()
             mapping = data.get("mapping", {})
             cur = data.get("current_node", "")
@@ -273,6 +319,8 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
             if urls:
                 logger.info(f"[IMAGES_GEN] POLL | break early, got {len(urls)} url(s)")
                 break
+        except _RateLimitError:
+            raise
         except Exception as e:
             logger.error(f"[IMAGES_GEN] Poll error: {e}")
         await asyncio.sleep(8)
@@ -280,49 +328,12 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
     return urls
 
 
-@app.post("/v1/images/generations")
-async def images_generations(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials = Security(security_scheme),
-):
-    req_token = credentials.credentials
-    req_token = get_req_token(req_token)
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
-        )
-
-    model = body.get("model", "gpt-image-2")
-    prompt = body.get("prompt", "")
-    size = body.get("size", "")
-    image_refs = body.get("image", [])
-    logger.info(f"[IMAGES_GEN] REQUEST | model={model} | size={size} | prompt={prompt[:80]!r} | images={image_refs}")
-    if size:
-        prompt = f"[{size}] {prompt}"
-    image_refs = body.get("image", [])
-
-    if not prompt:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": {"message": "prompt is required", "type": "invalid_request_error"}},
-        )
-
-    # Build chat completions messages format
-    user_content = [{"type": "text", "text": prompt}]
-    refs = image_refs if isinstance(image_refs, list) else [image_refs]
-    for ref in refs:
-        if ref and isinstance(ref, str):
-            user_content.append({"type": "image_url", "image_url": {"url": ref}})
-
-    request_data = {
-        "model": model,
-        "messages": [{"role": "user", "content": user_content}],
-        "stream": True,
-    }
-
+async def _do_image_generation(req_token: str, request_data: dict, model: str):
+    """
+    执行一次完整的图片生成流程（发送对话 + 轮询图片）。
+    返回 (image_urls, req_token, cs.proxy_url)
+    遇到 429 限流时抛出 _RateLimitError。
+    """
     cs = ChatService(req_token)
     try:
         await cs.set_dynamic_data(request_data)
@@ -351,18 +362,15 @@ async def images_generations(
         if isinstance(res, types.AsyncGeneratorType):
             async for chunk in res:
                 text = chunk if isinstance(chunk, str) else chunk.decode()
-                # Extract conversation_id from SSE chunks
                 if conv_id is None and '"conversation_id"' in text:
                     m = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', text)
                     if m:
                         conv_id = m.group(1)
-                # Extract image URLs from ![image](url) pattern
                 found = re.findall(r"!\[image\]\(([^)]+)\)", text)
                 if found:
                     logger.info(f"[IMAGES_GEN] STREAM_IMG | found={found}")
                 image_urls.extend(found)
         else:
-            # Non-stream response
             content = ""
             try:
                 content = (
@@ -374,52 +382,122 @@ async def images_generations(
                 pass
             image_urls = re.findall(r"!\[image\]\(([^)]+)\)", content)
 
-        # If no images in stream, poll conversation for async results
         if not image_urls and conv_id:
             logger.info(f"[IMAGES_GEN] No images in stream, polling conv {conv_id}")
-            image_urls = await _poll_images(cs, conv_id)
+            image_urls = await _poll_images(cs, conv_id)  # may raise _RateLimitError
 
+        proxy_url = getattr(cs, "proxy_url", None)
+        return image_urls, req_token, proxy_url
+    finally:
         if hasattr(cs, "s"):
             await cs.close_client()
 
-        if not image_urls:
+
+@app.post("/v1/images/generations")
+async def images_generations(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Security(security_scheme),
+):
+    initial_token = credentials.credentials
+    initial_token = get_req_token(initial_token)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+        )
+
+    model = body.get("model", "gpt-image-2")
+    prompt = body.get("prompt", "")
+    size = body.get("size", "")
+    image_refs = body.get("image", [])
+    logger.info(f"[IMAGES_GEN] REQUEST | model={model} | size={size} | prompt={prompt[:80]!r} | images={image_refs}")
+    if size:
+        prompt = f"[{size}] {prompt}"
+
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "prompt is required", "type": "invalid_request_error"}},
+        )
+
+    user_content = [{"type": "text", "text": prompt}]
+    refs = image_refs if isinstance(image_refs, list) else [image_refs]
+    for ref in refs:
+        if ref and isinstance(ref, str):
+            user_content.append({"type": "image_url", "image_url": {"url": ref}})
+
+    request_data = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "stream": True,
+    }
+
+    MAX_TOKEN_RETRIES = 3
+    req_token = initial_token
+    used_tokens = set()
+    image_urls = []
+    proxy_url = None
+
+    for attempt_no in range(MAX_TOKEN_RETRIES + 1):
+        used_tokens.add(req_token)
+        _img_gen_active_tokens.add(req_token)
+        logger.info(f"[IMAGES_GEN] ATTEMPT {attempt_no + 1}/{MAX_TOKEN_RETRIES + 1} | token=...{req_token[-8:]}")
+        try:
+            image_urls, req_token, proxy_url = await _do_image_generation(req_token, request_data, model)
+            break  # 成功，退出重试循环
+        except _RateLimitError as e:
+            logger.warning(f"[IMAGES_GEN] RateLimit on attempt {attempt_no + 1}: {e}")
+            if attempt_no < MAX_TOKEN_RETRIES:
+                new_token = _pick_idle_token(req_token)
+                if new_token == req_token or new_token in used_tokens:
+                    logger.warning(f"[IMAGES_GEN] No fresh token available, giving up")
+                    raise HTTPException(
+                        status_code=429,
+                        detail={"error": {"message": "Rate limited and no alternative token available", "type": "rate_limit_error"}},
+                    )
+                logger.info(f"[IMAGES_GEN] Switching token for retry {attempt_no + 2}")
+                req_token = new_token
+            else:
+                raise HTTPException(
+                    status_code=429,
+                    detail={"error": {"message": "Rate limited after all token retries", "type": "rate_limit_error"}},
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[IMAGES_GEN] Unexpected error on attempt {attempt_no + 1}: {e}")
             raise HTTPException(
                 status_code=500,
-                detail={"error": {"message": "Image generation failed or timed out", "type": "server_error"}},
+                detail={"error": {"message": str(e), "type": "server_error"}},
             )
+        finally:
+            _img_gen_active_tokens.discard(req_token)
 
-        logger.info(f"[IMAGES_GEN] RESPONSE | total_urls={len(image_urls)} | urls={image_urls}")
-
-        # Download images to server and return public URLs
-        public_urls = []
-        for url in image_urls:
-            local_path = await _download_image(url, req_token, cs.proxy_url)
-            if local_path:
-                filename = os.path.basename(local_path)
-                public_url = f"http://18.139.145.60:9001/v1/images/generations/file/{filename}"
-                public_urls.append(public_url)
-                logger.info(f"[IMAGES_GEN] PUBLIC_URL | {url} -> {public_url}")
-            else:
-                # Fallback: return original URL
-                public_urls.append(url)
-
-        # Increment successful generation counter
-        new_count = _inc_img_gen_count()
-        logger.info(f"[IMG_COUNT] Incremented to {new_count}")
-        return {"created": int(time.time()), "data": [{"url": u} for u in public_urls]}
-
-    except HTTPException:
-        if hasattr(cs, "s"):
-            await cs.close_client()
-        raise
-    except Exception as e:
-        if hasattr(cs, "s"):
-            await cs.close_client()
-        logger.error(f"[IMAGES_GEN] Error: {e}")
+    if not image_urls:
         raise HTTPException(
             status_code=500,
-            detail={"error": {"message": str(e), "type": "server_error"}},
+            detail={"error": {"message": "Image generation failed or timed out", "type": "server_error"}},
         )
+
+    logger.info(f"[IMAGES_GEN] RESPONSE | total_urls={len(image_urls)} | urls={image_urls}")
+
+    public_urls = []
+    for url in image_urls:
+        local_path = await _download_image(url, req_token, proxy_url)
+        if local_path:
+            filename = os.path.basename(local_path)
+            public_url = f"http://18.139.145.60:9001/v1/images/generations/file/{filename}"
+            public_urls.append(public_url)
+            logger.info(f"[IMAGES_GEN] PUBLIC_URL | {url} -> {public_url}")
+        else:
+            public_urls.append(url)
+
+    new_count = _inc_img_gen_count()
+    logger.info(f"[IMG_COUNT] Incremented to {new_count}")
+    return {"created": int(time.time()), "data": [{"url": u} for u in public_urls]}
 
 
 @app.get("/v1/images/generations/count")
