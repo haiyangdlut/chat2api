@@ -12,27 +12,49 @@
             const clearForm = document.getElementById('clearForm');
             const errorButton = document.getElementById('errorButton');
 
-            if (apiPrefix === "None") {
-                uploadForm.action = "/tokens/upload";
-                clearForm.action = "/tokens/clear";
-                errorButton.dataset.api = "/tokens/error";
-            } else {
-                uploadForm.action = `/${apiPrefix}/tokens/upload`;
-                clearForm.action = `/${apiPrefix}/tokens/clear`;
-                errorButton.dataset.api = `/${apiPrefix}/tokens/error`;
+            function getBasePath() {
+                if (apiPrefix === "None" || !apiPrefix) return "";
+                return "/" + apiPrefix;
             }
 
+            uploadForm.action = getBasePath() + "/tokens/upload";
+            clearForm.action = getBasePath() + "/tokens/clear";
+            errorButton.dataset.api = getBasePath() + "/tokens/error";
+
+            const quickAddBtn = document.getElementById('quickAddBtn');
+            const quickToken = document.getElementById('quickToken');
+            const quickRemark = document.getElementById('quickRemark');
+
+            quickAddBtn.addEventListener('click', async () => {
+                const token = quickToken.value.trim();
+                if (!token) { alert('请输入 Token'); return; }
+                const remark = quickRemark.value.trim();
+                const text = remark ? token + '|' + remark : token;
+                const formData = new FormData();
+                formData.append('text', text);
+                try {
+                    const res = await fetch(getBasePath() + '/tokens/upload', { method: 'POST', body: formData });
+                    const data = await res.json();
+                    if (res.ok) {
+                        alert('添加成功');
+                        quickToken.value = '';
+                        quickRemark.value = '';
+                        location.reload();
+                    } else {
+                        alert('添加失败：' + (data.detail || JSON.stringify(data)));
+                    }
+                } catch (e) {
+                    alert('请求失败：' + e.message);
+                }
+            });
+
             errorButton.addEventListener('click', async () => {
-                const response = await fetch(errorButton.dataset.api, {
-                    method: 'POST',
-                });
+                const response = await fetch(errorButton.dataset.api, { method: 'POST' });
                 const result = await response.json();
                 const errorTokens = result.error_tokens;
-
                 const errorModal = document.getElementById('errorModal');
                 const errorModalContent = document.getElementById('errorModalContent');
-
-                errorModalContent.innerHTML = errorTokens.map(token => `<p>${token}</p>`).join('');
+                errorModalContent.innerHTML = errorTokens.map(t => `<p>${t}</p>`).join('');
                 errorModal.classList.remove('hidden');
             });
 
@@ -41,40 +63,72 @@
             });
 
             document.getElementById('errorModalCopy').addEventListener('click', () => {
-                const errorModalContent = document.getElementById('errorModalContent');
-                const textToCopy = errorModalContent.innerText.replace(/\n\n/g, '\n');
-                navigator.clipboard.writeText(textToCopy).then(() => {
-                    alert('错误 Tokens 已复制到剪贴板');
-                }).catch(err => {
-                    alert('复制失败，请手动复制');
-                });
+                const text = document.getElementById('errorModalContent').innerText.replace(/\n\n/g, '\n');
+                navigator.clipboard.writeText(text).then(() => alert('已复制')).catch(() => alert('复制失败'));
             });
         });
     </script>
 </head>
-<body class="bg-gradient-to-r from-blue-200 via-purple-200 to-pink-200 flex justify-center items-center min-h-screen">
-    <div class="bg-white p-10 rounded-lg shadow-2xl w-128 text-center">
-        <h1 class="text-4xl font-extrabold text-gray-900 mb-6">Tokens 管理</h1>
-        <p class="text-gray-600 mb-4">当前可用 Tokens 数量：<span class="text-blue-600">{{ tokens_count }}</span></p>
-        <form class="mb-2" id="uploadForm" method="post">
-            <textarea class="w-full p-4 mb-4 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none" name="text" placeholder="一行一个Token，可以是 AccessToken 或 RefreshToken" rows="10"></textarea>
-            <p class="text-gray-600 mb-2">注：使用docker时如果挂载了data文件夹则重启后不需要再次上传</p>
-            <button class="w-full bg-blue-600 text-white py-3 rounded-md hover:bg-blue-700 transition duration-300 mb-2" type="submit">上传</button>
+<body class="bg-gradient-to-r from-blue-200 via-purple-200 to-pink-200 flex justify-center items-start min-h-screen py-8">
+    <div class="bg-white p-8 rounded-lg shadow-2xl w-[800px]">
+        <h1 class="text-3xl font-extrabold text-gray-900 mb-2 text-center">Tokens 管理</h1>
+        <p class="text-gray-500 text-center mb-6">当前可用 Tokens：<span class="text-blue-600 font-bold">{{ tokens_count }}</span> 个</p>
+
+        <!-- 快速添加区 -->
+        <div class="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-md">
+            <h3 class="text-sm font-bold text-blue-700 mb-3">快速添加单个 Token</h3>
+            <div class="flex gap-2">
+                <input id="quickToken" class="flex-1 p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 font-mono text-sm"
+                       placeholder="粘贴 Token" />
+                <input id="quickRemark" class="flex-1 p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm"
+                       placeholder="备注（可选）" />
+                <button id="quickAddBtn" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition text-sm font-bold">添加</button>
+            </div>
+        </div>
+
+        <!-- 批量上传区 -->
+        <form id="uploadForm" method="post" class="mb-6">
+            <textarea class="w-full p-3 mb-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none font-mono text-sm"
+                      name="text"
+                      placeholder="一行一个 Token，格式：&#10;  token字符串                    ← 纯token（无备注）&#10;  token字符串|这是我的备注  ← token+备注（用竖线分隔）"
+                      rows="8"></textarea>
+            <p class="text-gray-400 text-xs mb-2">格式：token字符串 | 备注（用竖线分隔），一行一个。备注会显示在 tokens/status 中。</p>
+            <button class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition" type="submit">上传 Tokens</button>
         </form>
-        <button id="errorButton" class="w-full bg-yellow-600 text-white py-3 rounded-md hover:bg-yellow-700 transition duration-200 mt-2">查看错误Tokens</button>
-        <p class="text-gray-600 mt-2">点击清空，将会清空上传和错误的 Tokens</p>
-        <form id="clearForm" method="post">
-            <button class="w-full bg-red-600 text-white py-3 rounded-md hover:bg-red-700 transition duration-300" type="submit">清空Tokens</button>
-        </form>
+
+        <!-- 当前 Token 列表 -->
+        {% if token_items %}
+        <div class="mb-6">
+            <h2 class="text-lg font-bold text-gray-700 mb-3">当前 Token 列表</h2>
+            <div class="space-y-2 max-h-80 overflow-y-auto">
+                {% for item in token_items %}
+                <div class="flex items-center gap-2 p-2 rounded {% if item.is_error %}bg-red-50 border border-red-200{% else %}bg-gray-50 border border-gray-200{% endif %}">
+                    <span class="font-mono text-xs text-gray-500 flex-shrink-0">{{ item.token[:20] }}...</span>
+                    <span class="flex-1 text-xs text-gray-600 truncate" title="{{ item.note }}">{{ item.note or '—' }}</span>
+                    <span class="flex-shrink-0 text-xs px-2 py-0.5 rounded {% if item.is_error %}bg-red-100 text-red-600{% else %}bg-green-100 text-green-600{% endif %}">
+                        {{ '已禁用' if item.is_error else '正常' }}
+                    </span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="flex gap-2">
+            <button id="errorButton" class="flex-1 bg-yellow-500 text-white py-2 rounded-md hover:bg-yellow-600 transition">查看错误Tokens</button>
+            <button onclick="if(confirm('确定要清空所有 Tokens 吗？')) document.getElementById('clearForm').submit()"
+                    class="flex-1 bg-red-600 text-white py-2 rounded-md hover:bg-red-700 transition">清空Tokens</button>
+        </div>
+        <form id="clearForm" method="post" class="hidden"></form>
     </div>
-    
+
     <div id="errorModal" class="fixed inset-0 bg-gray-800 bg-opacity-75 flex justify-center items-center hidden">
-        <div class="bg-white p-6 rounded-lg shadow-lg w-150">
-            <h2 class="text-2xl font-bold mb-4">错误 Tokens</h2>
-            <div id="errorModalContent" class="list-disc list-inside text-left mb-4"></div>
-            <div class="flex justify-end space-x-4">
-                <button id="errorModalCopy" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition duration-300">复制</button>
-                <button id="errorModalClose" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700 transition duration-300">关闭</button>
+        <div class="bg-white p-6 rounded-lg shadow-lg w-[600px]">
+            <h2 class="text-xl font-bold mb-4">错误 Tokens</h2>
+            <div id="errorModalContent" class="list-disc list-inside text-left mb-4 max-h-60 overflow-y-auto"></div>
+            <div class="flex justify-end gap-4">
+                <button id="errorModalCopy" class="bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700">复制</button>
+                <button id="errorModalClose" class="bg-red-600 text-white py-2 px-4 rounded-md hover:bg-red-700">关闭</button>
             </div>
         </div>
     </div>

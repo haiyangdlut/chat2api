@@ -12,7 +12,7 @@ from utils.Logger import logger
 
 def get_req_token(req_token, seed=None):
     if configs.auto_seed:
-        available_token_list = list(set(globals.token_list) - set(globals.error_token_list))
+        available_token_list = list(set(_token_set()) - set(globals.error_token_list))
         length = len(available_token_list)
         if seed and length > 0:
             if seed not in globals.seed_map.keys():
@@ -68,7 +68,7 @@ async def verify_token(req_token):
 
 
 async def refresh_all_tokens(force_refresh=False):
-    for token in list(set(globals.token_list) - set(globals.error_token_list)):
+    for token in list(set(_token_set()) - set(globals.error_token_list)):
         if len(token) == 45:
             try:
                 await asyncio.sleep(0.5)

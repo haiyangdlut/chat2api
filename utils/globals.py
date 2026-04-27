@@ -84,15 +84,103 @@ if os.path.exists(CONVERSATION_MAP_FILE):
 else:
     conversation_map = {}
 
+
+def _get_token_str(item):
+    """兼容旧字符串 token 和新 dict token。"""
+    if isinstance(item, dict):
+        return item.get("token", "")
+    return item
+
+
+def _get_token_note(item):
+    """获取 note，无则为空字符串。"""
+    if isinstance(item, dict):
+        return item.get("note", "")
+    return ""
+
+
+def _is_token_error(token_str):
+    return token_str in error_token_list
+
+
+def _add_token(token_str, note=""):
+    """添加 token 到列表并持久化（JSONL）。"""
+    entry = {"token": token_str, "note": note}
+    token_list.append(entry)
+    with open(TOKENS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _clear_tokens():
+    """清空所有 token 并写空文件。"""
+    token_list.clear()
+    error_token_list.clear()
+    with open(TOKENS_FILE, "w", encoding="utf-8") as f:
+        pass
+    with open(ERROR_TOKENS_FILE, "w", encoding="utf-8") as f:
+        pass
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _get_token_str(item):
+    """从 token_list 条目提取 token 字符串（兼容 dict / str）。"""
+    if isinstance(item, dict):
+        return item.get("token", "")
+    return item
+
+
+def _get_token_note(item):
+    """从 token_list 条目提取 note（无则为空字符串）。"""
+    if isinstance(item, dict):
+        return item.get("note", "")
+    return ""
+
+
+def _token_set():
+    """当前可用 token（字符串集合），用于 error_token 判断。"""
+    return {_get_token_str(t) for t in token_list}
+
+
+def _add_token(token_str, note=""):
+    """添加到 token_list 并持久化为 JSONL。"""
+    entry = {"token": token_str, "note": note}
+    token_list.append(entry)
+    with open(TOKENS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _clear_all_tokens():
+    """清空 token_list 和 error_token_list。"""
+    token_list.clear()
+    error_token_list.clear()
+    with open(TOKENS_FILE, "w", encoding="utf-8") as f:
+        pass
+    with open(ERROR_TOKENS_FILE, "w", encoding="utf-8") as f:
+        pass
+
+
+# ── load token_list（兼容旧纯文本 / 新 JSONL）─────────────────────────────────
+
 if os.path.exists(TOKENS_FILE):
     with open(TOKENS_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            if line.strip() and not line.startswith("#"):
-                token_list.append(line.strip())
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                entry = json.loads(line)
+                if isinstance(entry, dict) and "token" in entry:
+                    token_list.append(entry)
+                elif isinstance(entry, str):
+                    token_list.append({"token": entry, "note": ""})
+            except json.JSONDecodeError:
+                token_list.append({"token": line, "note": ""})
 else:
     with open(TOKENS_FILE, "w", encoding="utf-8") as f:
         pass
 
+# 加载 error_token_list
 if os.path.exists(ERROR_TOKENS_FILE):
     with open(ERROR_TOKENS_FILE, "r", encoding="utf-8") as f:
         for line in f:

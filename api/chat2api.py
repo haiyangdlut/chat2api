@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import types
 import uuid
 
@@ -18,6 +18,10 @@ from utils.retry import async_retry
 
 
 # ===================== 全局变量 =====================
+
+# 兼容旧代码：_token_set() 返回去重后的可用 token 集合
+def _token_set():
+    return set(globals.token_list)
 
 # 请求追踪 ID 中间件：每个外部请求分配唯一 trace_id
 @app.middleware("http")
@@ -117,7 +121,7 @@ async def send_conversation(request: Request, credentials: HTTPAuthorizationCred
 
 @app.get(f"/{api_prefix}/tokens" if api_prefix else "/tokens", response_class=HTMLResponse)
 async def upload_html(request: Request):
-    tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
+    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
     return templates.TemplateResponse("tokens.html",
                                       {"request": request, "api_prefix": api_prefix, "tokens_count": tokens_count})
 
@@ -131,7 +135,7 @@ async def upload_post(text: str = Form(...)):
             with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
                 f.write(line.strip() + "\n")
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
-    tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
+    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
 
 
@@ -142,7 +146,7 @@ async def clear_tokens():
     with open(globals.TOKENS_FILE, "w", encoding="utf-8") as f:
         pass
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
-    tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
+    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
 
 
@@ -160,32 +164,62 @@ async def tokens_status():
     """
     from utils.Client import Client
     results = []
-    all_tokens = list(set(globals.token_list))
+    error_set = set(globals.error_token_list)
+    # 统一提取 token 字符串（兼容旧格式字符串 和 新格式 {"token":..., "note":...}）
+    all_token_strs = []
+    for item in globals.token_list:
+        if isinstance(item, dict):
+            all_token_strs.append(item.get("token", ""))
+        else:
+            all_token_strs.append(str(item))
+    all_token_strs = list(set(all_token_strs))
+    # 构建 token_str -> note 的映射
+    note_map = {}
+    for item in globals.token_list:
+        if isinstance(item, dict):
+            t = item.get("token", "")
+            n = item.get("note", "")
+            note_map[t] = n
     proxy = "socks5://warp:1080"
-    for token in all_tokens:
-        short = f"...{token[-8:]}"
-        is_error = token in set(globals.error_token_list)
+    for token_str in all_token_strs:
+        short = f"...{token_str[-8:]}"
+        is_error = token_str in error_set
         status = "error" if is_error else "unknown"
+        note = note_map.get(token_str, "")
         image_gen = None
         if not is_error:
             try:
                 client = Client(proxy=proxy, timeout=15)
                 resp = await client.get(
                     "https://chatgpt.com/backend-api/me",
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers={"Authorization": f"Bearer {token_str}"},
                 )
                 await client.close()
-                if resp.status_code == 200:
+                status_code = resp.status_code
+                # 优先检查响应体里的特殊错误
+                if status_code == 200:
                     data = resp.json()
-                    if data.get("error"):
-                        status = "invalid"
-                    else:
-                        status = "active"
-                        image_gen = data.get("features", {}).get("image_generation", {}).get("is_available")
-                elif resp.status_code == 401:
+                    error_msg = data.get("error", {})
+                    if isinstance(error_msg, dict):
+                        error_msg = error_msg.get("message", "")
+                    # 内容违规 - 用户提示语问题，任何 token 都无法解决，直接返回
+                    if error_msg and "content policies" in error_msg:
+                        return {
+                            "error": "content_policy_error",
+                            "message": f"Your request violated content policies and cannot be processed. Details: {error_msg}"
+                        }
+                    status = "active"
+                    image_gen = data.get("features", {}).get("image_generation", {}).get("is_available")
+                elif status_code == 401:
                     status = "invalid"
+                elif status_code == 429:
+                    # 配额用完 - 当前 token 账号额度问题，换 token 重试
+                    return {
+                        "error": "plus_plan_limit",
+                        "message": "This token has hit the plus plan limit. Switch to another token and retry."
+                    }
                 else:
-                    status = f"http_{resp.status_code}"
+                    status = f"http_{status_code}"
             except Exception as e:
                 status = f"error_{type(e).__name__}"
         results.append({
@@ -193,6 +227,7 @@ async def tokens_status():
             "status": status,
             "image_gen_available": image_gen,
             "is_error_token": is_error,
+            "note": note,
         })
     active = [r for r in results if r["status"] == "active"]
     invalid = [r for r in results if r["status"] == "invalid"]
@@ -213,7 +248,7 @@ async def add_token(token: str):
         with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
             f.write(token.strip() + "\n")
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
-    tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
+    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
 
 
@@ -309,7 +344,7 @@ def _pick_idle_token(current_token: str) -> str:
     从可用 token 列表中优先选一个当前没在跑图片生成的 token。
     如果全都在用，则随机选一个（不选当前 token）。
     """
-    available = list(set(globals.token_list) - set(globals.error_token_list))
+    available = list(set(_token_set()) - set(globals.error_token_list))
     if len(available) <= 1:
         return current_token  # 只有一个 token，没得换
     idle = [t for t in available if t not in _img_gen_active_tokens and t != current_token]
@@ -365,10 +400,19 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
                 node = mapping[cur]
                 parts = node.get("message", {}).get("content", {}).get("parts", [])
                 logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | parts_count={len(parts)} | parts_types={[p.get('content_type') if isinstance(p,dict) else type(p).__name__ for p in parts]}")
-                # Log str content for debugging
+                # Log str content for debugging + detect fatal errors
                 for p in parts:
                     if isinstance(p, str) and p.strip():
                         logger.info(f"[IMAGES_GEN] POLL | attempt={i+1} | str_content={p[:200]!r}")
+                        # plus plan limit → 该 token 配额用完，需要换 token
+                        if "plus plan limit" in p.lower():
+                            raise _RateLimitError(f"plus plan limit hit on conv {conv_id}: {p[:120]}")
+                        # content policies → 提示语违规，任何 token 都无法解决
+                        if "content policies" in p.lower():
+                            raise HTTPException(
+                                status_code=400,
+                                detail={"error": {"message": f"Content policy violation: {p[:120]}", "type": "content_policy_error"}},
+                            )
                         break
                 for p in parts:
                     if isinstance(p, dict) and p.get("content_type") == "image_asset_pointer":
@@ -389,6 +433,8 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
                 logger.info(f"[IMAGES_GEN] POLL | break early, got {len(urls)} url(s)")
                 break
         except _RateLimitError:
+            raise
+        except HTTPException:
             raise
         except Exception as e:
             logger.error(f"[IMAGES_GEN] Poll error: {e}")
