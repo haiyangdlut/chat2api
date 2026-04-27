@@ -1,5 +1,6 @@
-import asyncio
+﻿import asyncio
 import types
+import uuid
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Request, HTTPException, Form, Security
@@ -11,9 +12,23 @@ import utils.globals as globals
 from app import app, templates, security_scheme
 from chatgpt.ChatService import ChatService
 from chatgpt.authorization import refresh_all_tokens, get_req_token
-from utils.Logger import logger
+from utils.Logger import logger, set_trace_id
 from utils.configs import api_prefix, scheduled_refresh
 from utils.retry import async_retry
+
+
+# ===================== 全局变量 =====================
+
+# 请求追踪 ID 中间件：每个外部请求分配唯一 trace_id
+@app.middleware("http")
+async def trace_middleware(request: Request, call_next):
+    trace_id = request.headers.get("X-Trace-ID") or str(uuid.uuid4())[:8]
+    set_trace_id(trace_id)
+    logger.info(f"REQUEST | {request.method} {request.url.path} | trace_id={trace_id}")
+    response = await call_next(request)
+    response.headers["X-Trace-ID"] = trace_id
+    return response
+
 
 # 记录当前正在使用的 token（用于图片生成换 token 时优先选空闲的）
 _img_gen_active_tokens: set = set()
@@ -135,6 +150,60 @@ async def clear_tokens():
 async def error_tokens():
     error_tokens_list = list(set(globals.error_token_list))
     return {"status": "success", "error_tokens": error_tokens_list}
+
+
+@app.get(f"/{api_prefix}/v1/tokens/status" if api_prefix else "/v1/tokens/status")
+async def tokens_status():
+    """
+    查询每个 token 的状态（有效 / 失效 / 错误）。
+    通过 /backend-api/me 探测，返回 token 摘要和 image_gen_tool_enabled 状态。
+    """
+    from utils.Client import Client
+    results = []
+    all_tokens = list(set(globals.token_list))
+    proxy = "socks5://warp:1080"
+    for token in all_tokens:
+        short = f"...{token[-8:]}"
+        is_error = token in set(globals.error_token_list)
+        status = "error" if is_error else "unknown"
+        image_gen = None
+        if not is_error:
+            try:
+                client = Client(proxy=proxy, timeout=15)
+                resp = await client.get(
+                    "https://chatgpt.com/backend-api/me",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                await client.close()
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("error"):
+                        status = "invalid"
+                    else:
+                        status = "active"
+                        image_gen = data.get("features", {}).get("image_generation", {}).get("is_available")
+                elif resp.status_code == 401:
+                    status = "invalid"
+                else:
+                    status = f"http_{resp.status_code}"
+            except Exception as e:
+                status = f"error_{type(e).__name__}"
+        results.append({
+            "token": short,
+            "status": status,
+            "image_gen_available": image_gen,
+            "is_error_token": is_error,
+        })
+    active = [r for r in results if r["status"] == "active"]
+    invalid = [r for r in results if r["status"] == "invalid"]
+    error = [r for r in results if r["status"].startswith("error_") or r["status"].startswith("http_")]
+    return {
+        "total": len(results),
+        "active_count": len(active),
+        "invalid_count": len(invalid),
+        "error_count": len(error),
+        "tokens": results,
+    }
 
 
 @app.get(f"/{api_prefix}/tokens/add/{token}" if api_prefix else "/tokens/add/{token}")
