@@ -175,7 +175,9 @@ if os.path.exists(TOKENS_FILE):
                 elif isinstance(entry, str):
                     token_list.append({"token": entry, "note": ""})
             except json.JSONDecodeError:
-                token_list.append({"token": line, "note": ""})
+                # 兼容旧格式 token|note
+                parts = line.split("|", 1)
+                token_list.append({"token": parts[0].strip(), "note": parts[1].strip() if len(parts) > 1 else ""})
 else:
     with open(TOKENS_FILE, "w", encoding="utf-8") as f:
         pass

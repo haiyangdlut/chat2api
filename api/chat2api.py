@@ -19,9 +19,7 @@ from utils.retry import async_retry
 
 # ===================== 全局变量 =====================
 
-# 兼容旧代码：_token_set() 返回去重后的可用 token 集合
-def _token_set():
-    return set(globals.token_list)
+# _token_set() 已移到 globals.py，统一用 globals._token_set()
 
 # 请求追踪 ID 中间件：每个外部请求分配唯一 trace_id
 @app.middleware("http")
@@ -121,7 +119,7 @@ async def send_conversation(request: Request, credentials: HTTPAuthorizationCred
 
 @app.get(f"/{api_prefix}/tokens" if api_prefix else "/tokens", response_class=HTMLResponse)
 async def upload_html(request: Request):
-    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
+    tokens_count = len(globals._token_set() - set(globals.error_token_list))
     return templates.TemplateResponse("tokens.html",
                                       {"request": request, "api_prefix": api_prefix, "tokens_count": tokens_count})
 
@@ -130,23 +128,24 @@ async def upload_html(request: Request):
 async def upload_post(text: str = Form(...)):
     lines = text.split("\n")
     for line in lines:
-        if line.strip() and not line.startswith("#"):
-            globals.token_list.append(line.strip())
-            with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
-                f.write(line.strip() + "\n")
+        line = line.strip()
+        if line and not line.startswith("#"):
+            # 支持 token|note 格式，用 | 分隔 token 和备注
+            parts = line.split("|", 1)
+            token_str = parts[0].strip()
+            note = parts[1].strip() if len(parts) > 1 else ""
+            if token_str:
+                globals._add_token(token_str, note)
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
-    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
+    tokens_count = len(globals._token_set() - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
 
 
 @app.post(f"/{api_prefix}/tokens/clear" if api_prefix else "/tokens/clear")
 async def clear_tokens():
-    globals.token_list.clear()
-    globals.error_token_list.clear()
-    with open(globals.TOKENS_FILE, "w", encoding="utf-8") as f:
-        pass
+    globals._clear_all_tokens()
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
-    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
+    tokens_count = len(globals._token_set() - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
 
 
@@ -243,12 +242,16 @@ async def tokens_status():
 
 @app.get(f"/{api_prefix}/tokens/add/{token}" if api_prefix else "/tokens/add/{token}")
 async def add_token(token: str):
-    if token.strip() and not token.startswith("#"):
-        globals.token_list.append(token.strip())
-        with open(globals.TOKENS_FILE, "a", encoding="utf-8") as f:
-            f.write(token.strip() + "\n")
+    token = token.strip()
+    if token and not token.startswith("#"):
+        # 支持 token|note 格式
+        parts = token.split("|", 1)
+        token_str = parts[0].strip()
+        note = parts[1].strip() if len(parts) > 1 else ""
+        if token_str:
+            globals._add_token(token_str, note)
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
-    tokens_count = len(set(_token_set()) - set(globals.error_token_list))
+    tokens_count = len(globals._token_set() - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
 
 
@@ -344,7 +347,7 @@ def _pick_idle_token(current_token: str) -> str:
     从可用 token 列表中优先选一个当前没在跑图片生成的 token。
     如果全都在用，则随机选一个（不选当前 token）。
     """
-    available = list(set(_token_set()) - set(globals.error_token_list))
+    available = list(globals._token_set() - set(globals.error_token_list))
     if len(available) <= 1:
         return current_token  # 只有一个 token，没得换
     idle = [t for t in available if t not in _img_gen_active_tokens and t != current_token]
