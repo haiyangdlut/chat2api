@@ -164,29 +164,20 @@ async def tokens_status():
     from utils.Client import Client
     results = []
     error_set = set(globals.error_token_list)
-    # 统一提取 token 字符串（兼容旧格式字符串 和 新格式 {"token":..., "note":...}）
-    all_token_strs = []
-    for item in globals.token_list:
-        if isinstance(item, dict):
-            all_token_strs.append(item.get("token", ""))
-        else:
-            all_token_strs.append(str(item))
-    all_token_strs = list(set(all_token_strs))
-    # 构建 token_str -> note 的映射
-    note_map = {}
-    for item in globals.token_list:
-        if isinstance(item, dict):
-            t = item.get("token", "")
-            n = item.get("note", "")
-            note_map[t] = n
+    # 使用 globals 的完整 token 列表（含 id, note, lock_info）
+    all_tokens = globals._token_list_all()
     proxy = "socks5://warp:1080"
-    for token_str in all_token_strs:
+    for item in all_tokens:
+        token_str = item.get("token", "")
         short = f"...{token_str[-8:]}"
         is_error = token_str in error_set
         status = "error" if is_error else "unknown"
-        note = note_map.get(token_str, "")
+        note = item.get("note", "")
+        token_id = item.get("id", "")
+        lock_info = item.get("lock_info")  # 可能为 None 或 dict
         image_gen = None
-        if not is_error:
+        is_locked = lock_info is not None
+        if not is_error and not is_locked:
             try:
                 client = Client(proxy=proxy, timeout=15)
                 resp = await client.get(
@@ -221,11 +212,16 @@ async def tokens_status():
                     status = f"http_{status_code}"
             except Exception as e:
                 status = f"error_{type(e).__name__}"
+        elif is_locked:
+            status = "locked"
         results.append({
+            "id": token_id,
             "token": short,
             "status": status,
             "image_gen_available": image_gen,
             "is_error_token": is_error,
+            "is_locked": is_locked,
+            "lock_info": lock_info,
             "note": note,
         })
     active = [r for r in results if r["status"] == "active"]
@@ -253,6 +249,28 @@ async def add_token(token: str):
     logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
     tokens_count = len(globals._token_set() - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
+
+
+@app.delete(f"/{api_prefix}/tokens/delete" if api_prefix else "/tokens/delete")
+async def delete_token(
+    token_id: str = None,
+    note: str = None,
+):
+    """删除 token，支持按 id 或 note（精确匹配）。"""
+    if not token_id and not note:
+        raise HTTPException(status_code=400, detail="Must provide either token_id or note")
+    
+    removed = False
+    if token_id:
+        removed = globals._remove_token_by_id(token_id)
+    elif note:
+        removed = globals._remove_token_by_note(note)
+    
+    if removed:
+        logger.info(f"Token removed: id={token_id}, note={note}")
+        return {"status": "success", "message": "Token removed"}
+    else:
+        raise HTTPException(status_code=404, detail="Token not found")
 
 
 @app.post(f"/{api_prefix}/seed_tokens/clear" if api_prefix else "/seed_tokens/clear")
@@ -568,6 +586,8 @@ async def images_generations(
             break  # 成功，退出重试循环
         except _RateLimitError as e:
             logger.warning(f"[IMAGES_GEN] RateLimit on attempt {attempt_no + 1}: {e}")
+            # 锁定当前 token（默认 1 小时）
+            globals._lock_token(req_token, duration_seconds=3600, reason="plus plan limit")
             if attempt_no < MAX_TOKEN_RETRIES:
                 new_token = _pick_idle_token(req_token)
                 if new_token == req_token or new_token in used_tokens:
