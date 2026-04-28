@@ -40,6 +40,7 @@ class ChatService:
         self.s = None
         self.ss = None
         self.image_gen_mode = False
+        self.aspect_ratio = None  # e.g. "16:9", "9:16", "1:1"
         self.ws = None
 
     async def set_dynamic_data(self, data):
@@ -344,6 +345,9 @@ class ChatService:
         }
         if self.conversation_id:
             self.chat_request['conversation_id'] = self.conversation_id
+        if self.image_gen_mode and self.aspect_ratio:
+            self.chat_request['meta'] = self.chat_request.get('meta', {})
+            self.chat_request['meta']['aspect_ratio'] = self.aspect_ratio
         return self.chat_request
 
     async def send_conversation(self):

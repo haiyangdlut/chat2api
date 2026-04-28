@@ -1,4 +1,5 @@
 import asyncio
+import math
 import types
 import uuid
 
@@ -475,6 +476,7 @@ async def _do_image_generation(req_token: str, request_data: dict, model: str):
     遇到 429 限流时抛出 _RateLimitError。
     """
     cs = ChatService(req_token)
+    cs.aspect_ratio = request_data.get("aspect_ratio")
     try:
         await cs.set_dynamic_data(request_data)
         await cs.get_chat_requirements()
@@ -554,8 +556,27 @@ async def images_generations(
     size = body.get("size", "")
     image_refs = body.get("image", [])
     logger.info(f"[IMAGES_GEN] REQUEST | model={model} | size={size} | prompt={prompt[:80]!r} | images={image_refs}")
+    # 把 size 标准化为 aspect_ratio（如 "1024x1792" → "9:16"）
+    aspect_ratio = None
     if size:
-        prompt = f"[{size}] {prompt}"
+        s = size.lower().strip()
+        if 'x' in s:
+            w, h = s.split('x', 1)
+            w, h = w.strip(), h.strip()
+            if w.isdigit() and h.isdigit():
+                ratio_w, ratio_h = int(w), int(h)
+                g = math.gcd(ratio_w, ratio_h)
+                aspect_ratio = f"{ratio_w//g}:{ratio_h//g}"
+        elif ':' in s:
+            aspect_ratio = s
+
+    # 日志打印 aspect_ratio 值，方便调试
+    logger.info(f"[IMAGES_GEN] aspect_ratio={aspect_ratio!r}  (size={size!r})")
+
+    # 在 prompt 末尾追加尺寸约束文本（ChatGPT 对自然语言指令响应更强）
+    if aspect_ratio:
+        ratio_hint = f" 请严格按照 {aspect_ratio} 的比例生成图片，宽度:高度必须符合 {aspect_ratio}。"
+        prompt += ratio_hint
 
     if not prompt:
         raise HTTPException(
@@ -573,6 +594,7 @@ async def images_generations(
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
         "stream": True,
+        "aspect_ratio": aspect_ratio,
     }
 
     MAX_TOKEN_RETRIES = 3
