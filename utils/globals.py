@@ -161,7 +161,7 @@ def _lock_token(token_str, duration_seconds=3600, reason="plus plan limit"):
         "reason": reason
     }
     _save_lock_map()
-    logger.info(f"Token locked: {token_str[-8:...]} for {duration_seconds}s, reason: {reason}")
+    logger.info(f"Token locked: {token_str[-8:]} for {duration_seconds}s, reason: {reason}")
 
 def _unlock_token(token_str):
     """手动解锁 token。"""

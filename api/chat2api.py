@@ -192,8 +192,8 @@ async def tokens_status():
                     error_msg = data.get("error", {})
                     if isinstance(error_msg, dict):
                         error_msg = error_msg.get("message", "")
-                    # 内容违规 - 用户提示语问题，任何 token 都无法解决，直接返回
-                    if error_msg and "content policies" in error_msg:
+                    # 内容违规（两种提示语措辞）- 用户提示语问题，任何 token 都无法解决，直接返回
+                    if error_msg and ("content policies" in error_msg or "similarity to third-party content" in error_msg):
                         return {
                             "error": "content_policy_error",
                             "message": f"Your request violated content policies and cannot be processed. Details: {error_msg}"
@@ -227,11 +227,13 @@ async def tokens_status():
     active = [r for r in results if r["status"] == "active"]
     invalid = [r for r in results if r["status"] == "invalid"]
     error = [r for r in results if r["status"].startswith("error_") or r["status"].startswith("http_")]
+    locked = [r for r in results if r["status"] == "locked"]
     return {
         "total": len(results),
         "active_count": len(active),
         "invalid_count": len(invalid),
         "error_count": len(error),
+        "locked_count": len(locked),
         "tokens": results,
     }
 
@@ -253,6 +255,7 @@ async def add_token(token: str):
 
 @app.delete(f"/{api_prefix}/tokens/delete" if api_prefix else "/tokens/delete")
 async def delete_token(
+    credentials: HTTPAuthorizationCredentials = Security(security_scheme),
     token_id: str = None,
     note: str = None,
 ):
@@ -428,8 +431,9 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
                         # plus plan limit → 该 token 配额用完，需要换 token
                         if "plus plan limit" in p.lower():
                             raise _RateLimitError(f"plus plan limit hit on conv {conv_id}: {p[:120]}")
-                        # content policies → 提示语违规，任何 token 都无法解决
-                        if "content policies" in p.lower():
+                        # content policies / similarity to third-party → 提示语违规，任何 token 都无法解决
+                        p_lower = p.lower()
+                        if "content policies" in p_lower or "similarity to third-party content" in p_lower:
                             raise HTTPException(
                                 status_code=400,
                                 detail={"error": {"message": f"Content policy violation: {p[:120]}", "type": "content_policy_error"}},
@@ -586,8 +590,8 @@ async def images_generations(
             break  # 成功，退出重试循环
         except _RateLimitError as e:
             logger.warning(f"[IMAGES_GEN] RateLimit on attempt {attempt_no + 1}: {e}")
-            # 锁定当前 token（默认 1 小时）
-            globals._lock_token(req_token, duration_seconds=3600, reason="plus plan limit")
+            # 锁定当前 token（默认 30 分钟）
+            globals._lock_token(req_token, duration_seconds=1800, reason="plus plan limit")
             if attempt_no < MAX_TOKEN_RETRIES:
                 new_token = _pick_idle_token(req_token)
                 if new_token == req_token or new_token in used_tokens:
