@@ -194,7 +194,7 @@ async def tokens_status():
                     if isinstance(error_msg, dict):
                         error_msg = error_msg.get("message", "")
                     # 内容违规（两种提示语措辞）- 用户提示语问题，任何 token 都无法解决，直接返回
-                    if error_msg and ("content policies" in error_msg or "similarity to third-party content" in error_msg):
+                    if error_msg and ("content policies" in error_msg or "similarity to third-party content" in error_msg or "guardrails" in error_msg):
                         return {
                             "error": "content_policy_error",
                             "message": f"Your request violated content policies and cannot be processed. Details: {error_msg}"
@@ -434,7 +434,7 @@ async def _poll_images(cs, conv_id, max_attempts=25, wait_initial=15):
                             raise _RateLimitError(f"plus plan limit hit on conv {conv_id}: {p[:120]}")
                         # content policies / similarity to third-party → 提示语违规，任何 token 都无法解决
                         p_lower = p.lower()
-                        if "content policies" in p_lower or "similarity to third-party content" in p_lower:
+                        if "content policies" in p_lower or "similarity to third-party content" in p_lower or "guardrails" in p_lower:
                             raise HTTPException(
                                 status_code=400,
                                 detail={"error": {"message": f"Content policy violation: {p[:120]}", "type": "content_policy_error"}},
